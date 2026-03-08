@@ -1,14 +1,18 @@
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, HttpUrl
-import string, random
+import string, random, os
 
 from database import SessionLocal, engine
 import models
 import cache
 
 models.Base.metadata.create_all(bind=engine)
+
+# Rate limit config (override via env vars)
+RATE_LIMIT  = int(os.getenv("RATE_LIMIT",  10))   # requests per IP
+RATE_WINDOW = int(os.getenv("RATE_WINDOW", 60))   # per N seconds
 
 app = FastAPI(title="URL Shortener")
 
@@ -28,6 +32,14 @@ def get_db():
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def get_client_ip(request: Request) -> str:
+    """Respect X-Forwarded-For when sitting behind a proxy/load balancer."""
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    return request.client.host
+
 
 def generate_code(length: int = 6) -> str:
     chars = string.ascii_letters + string.digits
@@ -68,7 +80,17 @@ class ShortenResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 @app.post("/shorten", response_model=ShortenResponse)
-def shorten_url(req: ShortenRequest, db: Session = Depends(get_db)):
+def shorten_url(req: ShortenRequest, request: Request, db: Session = Depends(get_db)):
+    # --- Rate limiting ---
+    ip = get_client_ip(request)
+    allowed, count, retry_after = cache.check_rate_limit(ip, RATE_LIMIT, RATE_WINDOW)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many requests. Try again in {retry_after}s.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
     code = req.custom_code or generate_code()
 
     existing = db.query(models.URL).filter(models.URL.short_code == code).first()
@@ -80,7 +102,6 @@ def shorten_url(req: ShortenRequest, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(url_entry)
 
-    # Warm the cache immediately after creation
     cache.cache_url(code, str(req.url))
 
     return ShortenResponse(
@@ -100,7 +121,6 @@ def redirect(
     original_url = cache.get_cached_url(short_code)
     if original_url:
         cache.increment_clicks(short_code)
-        # Flush buffered clicks to Postgres every 10 hits
         buffered = int(cache.get_redis().get(f"clicks:{short_code}") or 0)
         if buffered >= 10:
             background_tasks.add_task(flush_clicks_to_db, short_code)
@@ -124,7 +144,6 @@ def stats(short_code: str, db: Session = Depends(get_db)):
     if not url_entry:
         raise HTTPException(status_code=404, detail="Short URL not found.")
 
-    # Add any buffered (not-yet-flushed) clicks for an accurate live count
     buffered = cache.flush_clicks(short_code)
     if buffered:
         url_entry.clicks += buffered
@@ -144,7 +163,7 @@ def delete_url(short_code: str, db: Session = Depends(get_db)):
     if not url_entry:
         raise HTTPException(status_code=404, detail="Short URL not found.")
 
-    cache.invalidate_url(short_code)   # evict from cache first
+    cache.invalidate_url(short_code)
     db.delete(url_entry)
     db.commit()
     return {"message": f"'{short_code}' deleted successfully."}

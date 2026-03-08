@@ -40,3 +40,47 @@ def flush_clicks(short_code: str) -> int:
     key = f"clicks:{short_code}"
     delta = get_redis().getdel(key)
     return int(delta) if delta else 0
+
+
+# ---------- Sliding window rate limiter ----------
+
+def check_rate_limit(identifier: str, limit: int, window_seconds: int) -> tuple[bool, int, int]:
+    """
+    Sliding window rate limiter using a Redis sorted set.
+
+    Stores each request as a member with score = timestamp (ms).
+    Trims entries outside the window, then checks count vs limit.
+
+    Returns:
+        (allowed, current_count, retry_after_seconds)
+    """
+    import time
+
+    r = get_redis()
+    now_ms = int(time.time() * 1000)
+    window_ms = window_seconds * 1000
+    key = f"ratelimit:{identifier}"
+
+    pipe = r.pipeline()
+    # Remove requests outside the sliding window
+    pipe.zremrangebyscore(key, 0, now_ms - window_ms)
+    # Count remaining requests in window
+    pipe.zcard(key)
+    # Add current request
+    pipe.zadd(key, {str(now_ms): now_ms})
+    # Set TTL so key auto-expires
+    pipe.expire(key, window_seconds + 1)
+    results = pipe.execute()
+
+    current_count = results[1]  # count BEFORE adding current request
+
+    if current_count >= limit:
+        # Find the oldest entry to tell caller when window clears
+        oldest = r.zrange(key, 0, 0, withscores=True)
+        retry_after = 0
+        if oldest:
+            oldest_ms = int(oldest[0][1])
+            retry_after = max(0, window_seconds - (now_ms - oldest_ms) // 1000)
+        return False, current_count, retry_after
+
+    return True, current_count + 1, 0

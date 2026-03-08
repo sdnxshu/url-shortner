@@ -1,6 +1,6 @@
 services:
   db:
-    image: postgres:16-alpine
+    image: postgres:16
     restart: always
     environment:
       POSTGRES_USER: postgres
@@ -36,6 +36,8 @@ services:
       DATABASE_URL: postgresql://postgres:postgres@db:5432/urlshortener
       REDIS_URL: redis://redis:6379/0
       CACHE_TTL: 3600
+      RATE_LIMIT: 10
+      RATE_WINDOW: 60
     depends_on:
       db:
         condition: service_healthy
