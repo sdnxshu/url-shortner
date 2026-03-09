@@ -1,10 +1,10 @@
 import os
 import time
-import logging
+import structlog
 
 import redis
 
-logger = logging.getLogger("cache")
+logger = structlog.get_logger()
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 TTL = int(os.getenv("CACHE_TTL", 3600))       # seconds; default 1 hour

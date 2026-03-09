@@ -38,6 +38,8 @@ services:
       CACHE_TTL: 3600
       RATE_LIMIT: 10
       RATE_WINDOW: 60
+      LOG_LEVEL: INFO
+      LOG_FORMAT: json
     depends_on:
       db:
         condition: service_healthy
