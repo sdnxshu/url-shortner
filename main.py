@@ -8,14 +8,13 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, HttpUrl
 
-from database import SessionLocal, engine
+from database import SessionLocal
 import models
 import cache
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
 
-models.Base.metadata.create_all(bind=engine)
 
 RATE_LIMIT  = int(os.getenv("RATE_LIMIT",  10))
 RATE_WINDOW = int(os.getenv("RATE_WINDOW", 60))
