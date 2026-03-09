@@ -1,18 +1,24 @@
+import logging
+import string
+import random
+import os
+
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, HttpUrl
-import string, random, os
 
 from database import SessionLocal, engine
 import models
 import cache
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("main")
+
 models.Base.metadata.create_all(bind=engine)
 
-# Rate limit config (override via env vars)
-RATE_LIMIT  = int(os.getenv("RATE_LIMIT",  10))   # requests per IP
-RATE_WINDOW = int(os.getenv("RATE_WINDOW", 60))   # per N seconds
+RATE_LIMIT  = int(os.getenv("RATE_LIMIT",  10))
+RATE_WINDOW = int(os.getenv("RATE_WINDOW", 60))
 
 app = FastAPI(title="URL Shortener")
 
@@ -34,7 +40,6 @@ def get_db():
 # ---------------------------------------------------------------------------
 
 def get_client_ip(request: Request) -> str:
-    """Respect X-Forwarded-For when sitting behind a proxy/load balancer."""
     forwarded_for = request.headers.get("X-Forwarded-For")
     if forwarded_for:
         return forwarded_for.split(",")[0].strip()
@@ -52,9 +57,9 @@ def flush_clicks_to_db(short_code: str):
     if delta:
         db = SessionLocal()
         try:
-            url_entry = db.query(models.URL).filter(models.URL.short_code == short_code).first()
-            if url_entry:
-                url_entry.clicks += delta
+            entry = db.query(models.URL).filter(models.URL.short_code == short_code).first()
+            if entry:
+                entry.clicks += delta
                 db.commit()
         finally:
             db.close()
@@ -79,9 +84,19 @@ class ShortenResponse(BaseModel):
 # Endpoints
 # ---------------------------------------------------------------------------
 
+@app.get("/health")
+def health():
+    """Liveness + dependency check."""
+    redis_ok = cache.redis_healthy()
+    return {
+        "status": "ok",
+        "redis": "up" if redis_ok else "degraded — running Postgres-only",
+    }
+
+
 @app.post("/shorten", response_model=ShortenResponse)
 def shorten_url(req: ShortenRequest, request: Request, db: Session = Depends(get_db)):
-    # --- Rate limiting ---
+    # Rate limiting — fails open if Redis is down (see cache.check_rate_limit)
     ip = get_client_ip(request)
     allowed, count, retry_after = cache.check_rate_limit(ip, RATE_LIMIT, RATE_WINDOW)
     if not allowed:
@@ -102,6 +117,7 @@ def shorten_url(req: ShortenRequest, request: Request, db: Session = Depends(get
     db.commit()
     db.refresh(url_entry)
 
+    # Warm cache — silently skipped if Redis is down
     cache.cache_url(code, str(req.url))
 
     return ShortenResponse(
@@ -117,20 +133,21 @@ def redirect(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
-    # 1. Cache hit — fast path, no DB query needed
+    # 1. Cache hit — fast path (returns None if Redis is down)
     original_url = cache.get_cached_url(short_code)
     if original_url:
         cache.increment_clicks(short_code)
-        buffered = int(cache.get_redis().get(f"clicks:{short_code}") or 0)
+        buffered = cache.get_buffered_clicks(short_code)
         if buffered >= 10:
             background_tasks.add_task(flush_clicks_to_db, short_code)
         return RedirectResponse(url=original_url, status_code=302)
 
-    # 2. Cache miss — hit Postgres and populate cache
+    # 2. Cache miss OR Redis down — always falls back to Postgres
     url_entry = db.query(models.URL).filter(models.URL.short_code == short_code).first()
     if not url_entry:
         raise HTTPException(status_code=404, detail="Short URL not found.")
 
+    # Re-populate cache (no-op if Redis still down)
     cache.cache_url(short_code, url_entry.original_url)
     url_entry.clicks += 1
     db.commit()
@@ -144,6 +161,7 @@ def stats(short_code: str, db: Session = Depends(get_db)):
     if not url_entry:
         raise HTTPException(status_code=404, detail="Short URL not found.")
 
+    # Drain any buffered clicks — 0 if Redis is down, which is fine
     buffered = cache.flush_clicks(short_code)
     if buffered:
         url_entry.clicks += buffered
@@ -163,7 +181,7 @@ def delete_url(short_code: str, db: Session = Depends(get_db)):
     if not url_entry:
         raise HTTPException(status_code=404, detail="Short URL not found.")
 
-    cache.invalidate_url(short_code)
+    cache.invalidate_url(short_code)   # no-op if Redis is down
     db.delete(url_entry)
     db.commit()
     return {"message": f"'{short_code}' deleted successfully."}
